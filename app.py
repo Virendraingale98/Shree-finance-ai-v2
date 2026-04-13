@@ -521,6 +521,48 @@ def health_check():
 def ping():
     return "pong", 200
 
+@app.route('/debug-pdf', methods=['POST'])
+def debug_pdf():
+    """
+    ADMIN DEBUG ENDPOINT — shows raw PDF text + parsed fields.
+    Usage: POST with JSON body: {"media_url": "https://...twilio.../media"}
+    Call from Postman or curl to diagnose salary slip extraction issues.
+    """
+    try:
+        data      = request.get_json(force=True)
+        media_url = data.get("media_url", "")
+        if not media_url:
+            return {"error": "Send JSON: {\"media_url\": \"...\"}"}, 400
+
+        from pdf_parsers import download_pdf, detect_doc_type, parse_salary_slip, parse_bank_statement
+        import pdfplumber
+
+        pdf_bytes = download_pdf(media_url)
+
+        # Extract raw text
+        raw_text = ""
+        with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+            for i, page in enumerate(pdf.pages[:4]):
+                raw_text += f"\n--- PAGE {i+1} ---\n"
+                raw_text += (page.extract_text() or "[no text found]")
+
+        doc_type  = detect_doc_type(raw_text)
+        if doc_type == "salary":
+            parsed = parse_salary_slip(pdf_bytes)
+        elif doc_type == "bank":
+            parsed = parse_bank_statement(pdf_bytes)
+        else:
+            parsed = {"doc_type": doc_type}
+
+        return {
+            "detected_doc_type": doc_type,
+            "parsed_fields": parsed,
+            "raw_text_first_500_chars": raw_text[:500],
+            "full_raw_text": raw_text,
+        }, 200
+    except Exception as e:
+        return {"error": str(e)}, 500
+
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port, debug=False)
