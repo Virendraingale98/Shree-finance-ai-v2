@@ -56,12 +56,29 @@ BANK_PASSWORD_GENERATORS = {
     'SBI'  : lambda n, d: f"{n[:4].upper()}{d[0:2]}{d[2:4]}",
     'ICICI': lambda n, d: f"{n[:3].upper()}{d[0:2]}{d[3:5]}{d[6:]}",
     'AXIS' : lambda n, d: f"{n[:4].lower()}{d[6:]}",
+    'KOTAK': lambda n, d: f"{n[:4].upper()}{d[0:2]}{d[2:4]}",
+    # DHAN / general: FIRST4UPPER + DDMM  e.g. DHAN0101
+    'DHAN' : lambda n, d: f"{n[:4].upper()}{d[0:2]}{d[2:4]}",
+    # first4 lower + DDMM
+    'GEN1' : lambda n, d: f"{n[:4].lower()}{d[0:2]}{d[2:4]}",
+    # first4 upper + YYYY
+    'GEN2' : lambda n, d: f"{n[:4].upper()}{d[6:]}",
+    # first4 lower + YYYY
+    'GEN3' : lambda n, d: f"{n[:4].lower()}{d[6:]}",
+    # first4 + full DOB DDMMYYYY
+    'GEN4' : lambda n, d: f"{n[:4].upper()}{d[0:2]}{d[2:4]}{d[4:]}",
 }
 
 def generate_passwords(name: str, dob: str = "01011990", phone: str = "0000") -> list:
     """Generate common Indian bank PDF passwords to try auto-unlock."""
     first = name.strip().split()[0] if name else "user"
-    pwds  = [phone[-4:], dob.replace('/', ''), dob.replace('-', ''), ""]
+    pwds  = [
+        phone[-4:],
+        dob.replace('/', ''), dob.replace('-', ''),
+        "",
+        # Common simple passwords
+        "1234", "0000",
+    ]
     for fn in BANK_PASSWORD_GENERATORS.values():
         try:
             pwds.append(fn(first, dob))
@@ -377,73 +394,187 @@ def parse_itr(pdf_bytes: bytes) -> dict:
 def parse_bank_statement(pdf_bytes: bytes) -> dict:
     """
     Parse Bank Statement PDF.
-    IMPORTANT: Only extracts SALARY credits — not UPI, not transfers, not refunds.
-    Strategy: Match lines that contain salary keywords (SAL/SALARY/PAYROLL/WAGES)
-              alongside a credit amount. Ignores all other credit transactions.
+    Handles 3 common Indian bank statement formats:
+
+    Format A — Separate Debit / Credit columns:
+      Date | Narration           | Debit  | Credit | Balance
+      Mar1 | SAL/EMPLOYER/NEFT  |        | 25,000 | 1,25,000
+
+    Format B — Amount + Cr/Dr indicator column:
+      Date | Narration           | Amount    | Cr/Dr | Balance
+      Mar1 | SAL/EMPLOYER/NEFT  | 25,000.00 | Cr    | 1,25,000
+
+    Format C — Check/Tick indicator (customer's format):
+      Lines with salary keyword + 'Cr' OR 'CR' OR 'credit' near the amount
+
+    KEY FIX: When a line has multiple amounts (debit/credit/balance),
+    we pick the CREDIT amount using Cr/Dr indicator or column position.
     """
     if not PDF_SUPPORT:
         return {"error": "PDF parsing not available."}
 
-    full_text = ""
+    full_text  = ""
+    page_tables = []
+
     try:
         with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-            for page in pdf.pages[:6]:
+            for page in pdf.pages[:8]:
                 full_text += (page.extract_text() or "") + "\n"
+                # Also try to extract structured tables
+                tbl = page.extract_table()
+                if tbl:
+                    page_tables.extend(tbl)
     except Exception as e:
         return {"error": f"PDF read error: {e}"}
 
     salary_amounts = []
     employer       = "Unknown"
 
-    # ── STEP 1: Extract line-by-line to isolate transactions ──
-    lines = full_text.split("\n")
-
-    # Salary-specific keywords that MUST appear in the SAME line as the credit amount
-    # This prevents picking up random UPI/NEFT credits that are not salary
     SALARY_LINE_KEYWORDS = [
-        "salary", "sal ", "sal/", "/sal",
+        "salary", "sal ", "sal/", "/sal", "-sal", "sal-",
         "payroll", "pay roll",
         "wages", "wage",
-        "emolument",
-        "stipend",
-        "monthly pay",
-        "staff pay",
+        "emolument", "stipend",
+        "monthly pay", "staff pay",
     ]
 
-    for line in lines:
-        line_lower = line.lower()
+    # ─────────────────────────────────────────
+    # METHOD 1: Structured table extraction
+    # pdfplumber can extract table cells — much more accurate
+    # ─────────────────────────────────────────
+    if page_tables:
+        # Find header row to identify which column is Credit/Deposit
+        credit_col_idx = None
+        dr_cr_col_idx  = None
+        balance_col_idx = None
 
-        # Check if this line is a salary credit
-        is_salary_line = any(kw in line_lower for kw in SALARY_LINE_KEYWORDS)
-        if not is_salary_line:
-            continue
+        for row in page_tables[:5]:  # First 5 rows likely contain header
+            if not row:
+                continue
+            row_text = [str(c or "").lower() for c in row]
+            for i, cell in enumerate(row_text):
+                if any(k in cell for k in ["credit", "deposit", "cr amount"]):
+                    credit_col_idx = i
+                if any(k in cell for k in ["dr/cr", "cr/dr", "type", "indicator", "check"]):
+                    dr_cr_col_idx = i
+                if "balance" in cell:
+                    balance_col_idx = i
+            if credit_col_idx is not None or dr_cr_col_idx is not None:
+                break  # Found header
 
-        # Extract the amount from this salary line
-        # Bank statement amounts are typically 5-8 digits: 10000 to 9,99,999
-        amounts_in_line = re.findall(r'[\d,]{5,10}', line)
-        for amt_str in amounts_in_line:
-            try:
-                val = int(amt_str.replace(",", ""))
-                # Valid monthly salary range: Rs.8,000 to Rs.5,00,000
-                if 8000 < val < 500000:
-                    salary_amounts.append(val)
-                    break  # Take only the first valid amount per salary line
-            except ValueError:
+        for row in page_tables:
+            if not row:
+                continue
+            row_str = " ".join(str(c or "") for c in row).lower()
+
+            # Check if this row is a salary transaction
+            is_salary = any(kw in row_str for kw in SALARY_LINE_KEYWORDS)
+            if not is_salary:
                 continue
 
-    # ── STEP 2: Deduplicate — same salary credited twice on same page ──
-    # Keep only unique amounts (within 5% of each other = same salary month)
+            # FORMAT A: Separate Credit column found
+            if credit_col_idx is not None and credit_col_idx < len(row):
+                cell_val = str(row[credit_col_idx] or "").replace(",", "").replace(" ", "")
+                nums = re.findall(r'\d+\.?\d*', cell_val)
+                for n in nums:
+                    try:
+                        val = int(float(n))
+                        if 8000 < val < 500000:
+                            salary_amounts.append(val)
+                            break
+                    except ValueError:
+                        pass
+
+            # FORMAT B: Dr/Cr indicator column
+            elif dr_cr_col_idx is not None and dr_cr_col_idx < len(row):
+                indicator = str(row[dr_cr_col_idx] or "").lower().strip()
+                if indicator in ["cr", "credit", "c", "+"]:
+                    # Find first numeric cell that isn't the balance
+                    for ci, cell in enumerate(row):
+                        if ci == dr_cr_col_idx or ci == balance_col_idx:
+                            continue
+                        cell_clean = str(cell or "").replace(",", "").strip()
+                        nums = re.findall(r'\d+\.?\d*', cell_clean)
+                        for n in nums:
+                            try:
+                                val = int(float(n))
+                                if 8000 < val < 500000:
+                                    salary_amounts.append(val)
+                                    break
+                            except ValueError:
+                                pass
+                        if salary_amounts and salary_amounts[-1] > 0:
+                            break
+
+    # ─────────────────────────────────────────
+    # METHOD 2: Raw text line-by-line (fallback)
+    # Used when pdfplumber can't extract table structure
+    # ─────────────────────────────────────────
+    if not salary_amounts:
+        lines = full_text.split("\n")
+
+        for line in lines:
+            line_lower = line.lower()
+
+            is_salary_line = any(kw in line_lower for kw in SALARY_LINE_KEYWORDS)
+            if not is_salary_line:
+                continue
+
+            # ── FORMAT B TEXT: Check for Cr/Dr indicator on same line ──
+            # e.g. "15-Mar NEFT SAL EMPLOYER 25000.00 Cr 125000.00"
+            has_cr_indicator = bool(re.search(r'\bCr\b|\bCR\b|\bCredit\b', line))
+            has_dr_indicator = bool(re.search(r'\bDr\b|\bDR\b|\bDebit\b', line))
+
+            if has_dr_indicator and not has_cr_indicator:
+                # This is a DEBIT transaction — skip
+                continue
+
+            # Extract all amounts from the line
+            all_amounts = []
+            for amt_str in re.findall(r'[\d,]{5,12}(?:\.\d{1,2})?', line):
+                try:
+                    val = int(float(amt_str.replace(",", "")))
+                    if 8000 < val < 500000:
+                        all_amounts.append(val)
+                except ValueError:
+                    pass
+
+            if not all_amounts:
+                continue
+
+            if has_cr_indicator:
+                # FORMAT B: Amount right BEFORE 'Cr' is the credit amount
+                # Find position of 'Cr' and get the number just before it
+                cr_match = re.search(r'([\d,\.]+)\s+(?:Cr|CR|Credit)', line)
+                if cr_match:
+                    try:
+                        val = int(float(cr_match.group(1).replace(",", "")))
+                        if 8000 < val < 500000:
+                            salary_amounts.append(val)
+                            continue
+                    except ValueError:
+                        pass
+
+            # FORMAT C / A fallback: Multiple amounts → pick smallest valid
+            # Salary is usually SMALLER than balance on the same line
+            # e.g. SAL 25000 Cr 125000 → pick 25000, not 125000
+            if len(all_amounts) > 1:
+                # Sort ascending — salary amount is typically smaller than balance
+                all_amounts.sort()
+                salary_amounts.append(all_amounts[0])
+            elif len(all_amounts) == 1:
+                salary_amounts.append(all_amounts[0])
+
+    # ── Deduplicate: same salary credited on multiple pages ──
     unique_salaries = []
     for amt in salary_amounts:
         already_seen = any(abs(amt - s) / max(s, 1) < 0.05 for s in unique_salaries)
         if not already_seen:
             unique_salaries.append(amt)
 
-    # ── STEP 3: Average the unique monthly salary credits ──
     avg_salary = int(sum(unique_salaries) / len(unique_salaries)) if unique_salaries else 0
 
-    # ── STEP 4: Try to find employer from NEFT/salary description ──
-    # Looks for patterns like "NEFT-EMPLOYER NAME-SAL" or "FROM: XYZ LTD"
+    # ── Employer extraction ──
     employer_patterns = [
         r'(?:salary|sal)[^\n]*?(?:from|by|neft)[^\n]*?([A-Z][A-Z\s&.]{4,35})',
         r'neft[^\n]*?([A-Z][A-Z\s&.]{4,35})[^\n]*?(?:sal|salary)',
