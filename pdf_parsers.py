@@ -427,8 +427,13 @@ def parse_bank_statement(pdf_bytes: bytes) -> dict:
     except Exception as e:
         return {"error": f"PDF read error: {e}"}
 
-    salary_amounts = []
+    salary_amounts = [] # Will store tuples: (date_str, amount)
     employer       = "Unknown"
+
+    def extract_date_from_text(t: str) -> str:
+        # Matches formats like: 01-Jan, 12/03/2023, 15 Mar
+        m = re.search(r'\b(\d{1,2}[-/ .](?:[a-zA-Z]{3}|\d{1,2})(?:[-/ .]\d{2,4})?)\b', t)
+        return m.group(1) if m else "Unknown"
 
     SALARY_LINE_KEYWORDS = [
         "salary", "sal ", "sal/", "/sal", "-sal", "sal-",
@@ -436,7 +441,7 @@ def parse_bank_statement(pdf_bytes: bytes) -> dict:
         "wages", "wage",
         "emolument", "stipend",
         "monthly pay", "staff pay",
-        "treasury", "pension", "treasury chq", "treasury cheques"
+        "treasury", "pension", "treasury chq", "treasury cheques", "treasury checques"
     ]
 
     # ─────────────────────────────────────────
@@ -481,7 +486,8 @@ def parse_bank_statement(pdf_bytes: bytes) -> dict:
                     try:
                         val = int(float(n))
                         if 8000 < val < 500000:
-                            salary_amounts.append(val)
+                            dt = extract_date_from_text(" ".join(str(c or "") for c in row))
+                            salary_amounts.append((dt, val))
                             break
                     except ValueError:
                         pass
@@ -500,11 +506,12 @@ def parse_bank_statement(pdf_bytes: bytes) -> dict:
                             try:
                                 val = int(float(n))
                                 if 8000 < val < 500000:
-                                    salary_amounts.append(val)
+                                    dt = extract_date_from_text(" ".join(str(c or "") for c in row))
+                                    salary_amounts.append((dt, val))
                                     break
                             except ValueError:
                                 pass
-                        if salary_amounts and salary_amounts[-1] > 0:
+                        if salary_amounts and salary_amounts[-1][1] > 0:
                             break
 
     # ─────────────────────────────────────────
@@ -551,7 +558,8 @@ def parse_bank_statement(pdf_bytes: bytes) -> dict:
                     try:
                         val = int(float(cr_match.group(1).replace(",", "")))
                         if 8000 < val < 500000:
-                            salary_amounts.append(val)
+                            dt = extract_date_from_text(line)
+                            salary_amounts.append((dt, val))
                             continue
                     except ValueError:
                         pass
@@ -562,18 +570,52 @@ def parse_bank_statement(pdf_bytes: bytes) -> dict:
             if len(all_amounts) > 1:
                 # Sort ascending — salary amount is typically smaller than balance
                 all_amounts.sort()
-                salary_amounts.append(all_amounts[0])
+                dt = extract_date_from_text(line)
+                salary_amounts.append((dt, all_amounts[0]))
             elif len(all_amounts) == 1:
-                salary_amounts.append(all_amounts[0])
+                dt = extract_date_from_text(line)
+                salary_amounts.append((dt, all_amounts[0]))
 
     # ── Deduplicate: same salary credited on multiple pages ──
     unique_salaries = []
-    for amt in salary_amounts:
+    unique_dates = []
+    for dt, amt in salary_amounts:
         already_seen = any(abs(amt - s) / max(s, 1) < 0.05 for s in unique_salaries)
         if not already_seen:
             unique_salaries.append(amt)
+            if dt != "Unknown":
+                unique_dates.append(dt)
 
     avg_salary = int(sum(unique_salaries) / len(unique_salaries)) if unique_salaries else 0
+
+    # ── Calculate Consistency & Confidence ──
+    consistency_level = "Low"
+    confidence_score = 30  # Base confidence if at least 1 found
+    cv = 1.0
+
+    if len(unique_salaries) > 1:
+        import statistics
+        mean_sal = statistics.mean(unique_salaries)
+        std_sal = statistics.stdev(unique_salaries)
+        cv = std_sal / mean_sal if mean_sal > 0 else 1.0
+        
+        if cv < 0.05:
+            consistency_level = "High"
+            confidence_score = 95
+        elif cv < 0.15:
+            consistency_level = "Medium"
+            confidence_score = 75
+        else:
+            consistency_level = "Low"
+            confidence_score = 50
+    elif len(unique_salaries) == 1:
+        consistency_level = "Medium (Only 1 month found)"
+        confidence_score = 60
+    else:
+        consistency_level = "None"
+        confidence_score = 0
+
+    frequency_verified = len(unique_salaries) >= 3
 
     # ── Employer extraction ──
     employer_patterns = [
@@ -595,6 +637,10 @@ def parse_bank_statement(pdf_bytes: bytes) -> dict:
         "employer_name"         : employer,
         "salary_credits_found"  : unique_salaries,
         "months_detected"       : len(unique_salaries),
+        "confidence_score"      : confidence_score,
+        "consistency_level"     : consistency_level,
+        "frequency_verified"    : frequency_verified,
+        "salary_dates_found"    : unique_dates
     }
 
 
