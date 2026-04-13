@@ -436,6 +436,7 @@ def parse_bank_statement(pdf_bytes: bytes) -> dict:
         "wages", "wage",
         "emolument", "stipend",
         "monthly pay", "staff pay",
+        "treasury", "pension", "treasury chq", "treasury cheques"
     ]
 
     # ─────────────────────────────────────────
