@@ -95,7 +95,7 @@ if not os.path.exists('credit_model.pkl') or not os.path.exists('model_features.
     FEATURES = ['Monthly_Income', 'Existing_EMI', 'CIBIL_Score',
                 'Business_Vintage_Yrs', 'Loan_Amount', 'FOIR',
                 'Num_Active_Loans', 'Industry_Risk']
-    model = RandomForestClassifier(n_estimators=200, max_depth=20,
+    model = RandomForestClassifier(n_estimators=50, max_depth=10,
                                    class_weight='balanced', random_state=42)
     model.fit(df_train[FEATURES], df_train['Loan_Approved'])
     joblib.dump(model, 'credit_model.pkl')
