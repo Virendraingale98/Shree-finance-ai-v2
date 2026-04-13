@@ -328,22 +328,28 @@ def build_itr_reply(itr_data: dict) -> str:
 
 def build_bank_reply(bank_data: dict) -> str:
     """Build a formatted WhatsApp reply for a parsed bank statement."""
-    avg    = bank_data.get("average_monthly_salary", 0)
-    emp    = bank_data.get("employer_name", "Unknown")
+    avg     = bank_data.get("average_monthly_salary", 0)
+    emp     = bank_data.get("employer_name", "Unknown")
     credits = bank_data.get("salary_credits_found", [])
+    months  = bank_data.get("months_detected", len(credits))
 
-    credits_str = f"Rs.{', Rs.'.join(str(c) for c in credits[:3])}" \
-                  if credits else "—"
+    credits_str = f"Rs.{', Rs.'.join(str(c) for c in credits[:4])}" \
+                  if credits else "None found"
+
+    if avg == 0:
+        income_line = "Salary credits NOT found in statement.\nPlease send a Salary Slip PDF instead."
+    else:
+        income_line = f"Avg Monthly Salary: Rs.{avg:,} ({months} month(s) detected)"
 
     return (
-        f"✅ Bank Statement Read!\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"🏢 Employer    : {emp}\n"
-        f"💰 Avg Salary  : Rs.{avg:,}\n"
-        f"📋 Credits     : {credits_str}\n"
-        f"💾 Income data saved.\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"➡️ Next: Share your *CIBIL Score* or *Business Years*"
+        f"Bank Statement Read!\n"
+        f"--------------------\n"
+        f"Employer   : {emp}\n"
+        f"Salary Credits: {credits_str}\n"
+        f"{income_line}\n"
+        f"Income data saved.\n"
+        f"--------------------\n"
+        f"Next: Share your CIBIL Score or Business Years"
     )
 
 

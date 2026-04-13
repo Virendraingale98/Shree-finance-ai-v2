@@ -375,7 +375,12 @@ def parse_itr(pdf_bytes: bytes) -> dict:
 # ─────────────────────────────────────────────────────────────
 
 def parse_bank_statement(pdf_bytes: bytes) -> dict:
-    """Parse Bank Statement PDF — extracts avg salary credits."""
+    """
+    Parse Bank Statement PDF.
+    IMPORTANT: Only extracts SALARY credits — not UPI, not transfers, not refunds.
+    Strategy: Match lines that contain salary keywords (SAL/SALARY/PAYROLL/WAGES)
+              alongside a credit amount. Ignores all other credit transactions.
+    """
     if not PDF_SUPPORT:
         return {"error": "PDF parsing not available."}
 
@@ -390,28 +395,74 @@ def parse_bank_statement(pdf_bytes: bytes) -> dict:
     salary_amounts = []
     employer       = "Unknown"
 
-    salary_patterns = [
-        r'SALARY[^\d]*([\d,]{4,8})',
-        r'\bSAL\b[^\d]*([\d,]{4,8})',
-        r'NEFT\s+CR[^\d]*([\d,]{5,8})',
-        r'CREDIT.*?([\d,]{5,8})',
+    # ── STEP 1: Extract line-by-line to isolate transactions ──
+    lines = full_text.split("\n")
+
+    # Salary-specific keywords that MUST appear in the SAME line as the credit amount
+    # This prevents picking up random UPI/NEFT credits that are not salary
+    SALARY_LINE_KEYWORDS = [
+        "salary", "sal ", "sal/", "/sal",
+        "payroll", "pay roll",
+        "wages", "wage",
+        "emolument",
+        "stipend",
+        "monthly pay",
+        "staff pay",
     ]
-    for pat in salary_patterns:
-        for m in re.findall(pat, full_text, re.IGNORECASE):
-            val = int(m.replace(',', ''))
-            if 10000 < val < 500000:
-                salary_amounts.append(val)
 
-    emp_m = re.search(r'(?:FROM|BY|CR)[\s:]+([A-Z\s]{5,30})', full_text)
-    if emp_m:
-        employer = emp_m.group(1).strip()
+    for line in lines:
+        line_lower = line.lower()
 
-    avg_salary = int(sum(salary_amounts) / len(salary_amounts)) if salary_amounts else 0
+        # Check if this line is a salary credit
+        is_salary_line = any(kw in line_lower for kw in SALARY_LINE_KEYWORDS)
+        if not is_salary_line:
+            continue
+
+        # Extract the amount from this salary line
+        # Bank statement amounts are typically 5-8 digits: 10000 to 9,99,999
+        amounts_in_line = re.findall(r'[\d,]{5,10}', line)
+        for amt_str in amounts_in_line:
+            try:
+                val = int(amt_str.replace(",", ""))
+                # Valid monthly salary range: Rs.8,000 to Rs.5,00,000
+                if 8000 < val < 500000:
+                    salary_amounts.append(val)
+                    break  # Take only the first valid amount per salary line
+            except ValueError:
+                continue
+
+    # ── STEP 2: Deduplicate — same salary credited twice on same page ──
+    # Keep only unique amounts (within 5% of each other = same salary month)
+    unique_salaries = []
+    for amt in salary_amounts:
+        already_seen = any(abs(amt - s) / max(s, 1) < 0.05 for s in unique_salaries)
+        if not already_seen:
+            unique_salaries.append(amt)
+
+    # ── STEP 3: Average the unique monthly salary credits ──
+    avg_salary = int(sum(unique_salaries) / len(unique_salaries)) if unique_salaries else 0
+
+    # ── STEP 4: Try to find employer from NEFT/salary description ──
+    # Looks for patterns like "NEFT-EMPLOYER NAME-SAL" or "FROM: XYZ LTD"
+    employer_patterns = [
+        r'(?:salary|sal)[^\n]*?(?:from|by|neft)[^\n]*?([A-Z][A-Z\s&.]{4,35})',
+        r'neft[^\n]*?([A-Z][A-Z\s&.]{4,35})[^\n]*?(?:sal|salary)',
+        r'(?:FROM|BY)\s*[:\-]?\s*([A-Z][A-Z\s&.]{4,35})',
+    ]
+    for pat in employer_patterns:
+        m = re.search(pat, full_text, re.IGNORECASE)
+        if m:
+            name = m.group(1).strip().rstrip("0123456789 /-")
+            if len(name) > 3:
+                employer = name[:50]
+                break
+
     return {
-        "doc_type"             : "bank",
+        "doc_type"              : "bank",
         "average_monthly_salary": avg_salary,
-        "employer_name"        : employer,
-        "salary_credits_found" : salary_amounts,
+        "employer_name"         : employer,
+        "salary_credits_found"  : unique_salaries,
+        "months_detected"       : len(unique_salaries),
     }
 
 
