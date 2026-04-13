@@ -186,10 +186,11 @@ def ensure_19_col_headers():
         return False
 
 
-def log_19col_to_sheets(phone: str, session: dict, probability: float = 0.0):
+def log_19col_to_sheets(phone: str, session: dict, probability: float = 0.0,
+                        decision: str = "APPROVED"):
     """
     Write a full 19-column row to Google Sheets.
-    Called after ML prediction on an approved lead.
+    Called after ML prediction — logs BOTH approved AND rejected leads.
     """
     sheet = connect_sheets()
     if not sheet:
@@ -215,7 +216,7 @@ def log_19col_to_sheets(phone: str, session: dict, probability: float = 0.0):
         session.get("Business_Vintage_Yrs", 0),         # 6 Vintage
         session.get("Loan_Amount", 0),                  # 7 Loan Amount
         f"{foir * 100:.1f}%",                           # 8 FOIR
-        f"{probability * 100:.1f}%",                    # 9 Confidence
+        f"{probability * 100:.1f}% ({decision})",       # 9 Confidence + Decision
         session.get("Num_Active_Loans", 0),             # 10 Active Loans
         session.get("_cibil_overdue", 0),               # 11 Overdue
         session.get("_cibil_max_dpd", 0),               # 12 Max DPD
@@ -230,7 +231,7 @@ def log_19col_to_sheets(phone: str, session: dict, probability: float = 0.0):
 
     try:
         sheet.append_row(row)
-        print(f"[SHEETS] Logged 19-col row for {phone}")
+        print(f"[SHEETS] Logged 19-col row for {phone} — {decision}")
     except Exception as e:
         print(f"[SHEETS] Append error: {e}")
 

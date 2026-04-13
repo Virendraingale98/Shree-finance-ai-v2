@@ -459,38 +459,42 @@ def phone_not_in_sessions(phone: str) -> bool:
 
 def _prediction_block(session: dict, pred: int, prob: float,
                        foir: float, phone: str) -> str:
-    """Build the final loan decision reply and log to Sheets if approved."""
-    status      = "✅ APPROVED" if pred == 1 else "❌ REJECTED"
-    foir_status = "OK ✅" if foir < 0.5 else "HIGH ⚠️"
+    """Build the final loan decision reply and log ALL leads to Sheets."""
+    decision    = "APPROVED" if pred == 1 else "REJECTED"
+    status_icon = "APPROVED" if pred == 1 else "REJECTED"
+    foir_status = "OK" if foir < 0.5 else "HIGH"
+    income      = session.get('Monthly_Income', 0)  # uses latest (post-PDF) value
 
     block = (
-        f"\n\n🏦 *Shree Finance AI v3.3*\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"💰 Income    : Rs.{session.get('Monthly_Income', 0):,}\n"
-        f"📊 CIBIL     : {session.get('CIBIL_Score', 0)}\n"
-        f"💳 EMI       : Rs.{session.get('Existing_EMI', 0):,}\n"
-        f"📈 FOIR      : {foir * 100:.1f}% ({foir_status})\n"
-        f"📅 Vintage   : {session.get('Business_Vintage_Yrs', 0)} yrs\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"🎯 Decision  : *{status}*\n"
-        f"🔢 Confidence: {prob * 100:.1f}%\n"
+        f"\n\nShree Finance AI v3.3\n"
+        f"--------------------\n"
+        f"Income    : Rs.{income:,}\n"
+        f"CIBIL     : {session.get('CIBIL_Score', 0)}\n"
+        f"EMI       : Rs.{session.get('Existing_EMI', 0):,}\n"
+        f"FOIR      : {foir * 100:.1f}% ({foir_status})\n"
+        f"Vintage   : {session.get('Business_Vintage_Yrs', 0)} yrs\n"
+        f"--------------------\n"
+        f"Decision  : {status_icon}\n"
+        f"Confidence: {prob * 100:.1f}%\n"
     )
 
+    # Log ALL leads - approved AND rejected - to Google Sheets CRM
+    log_19col_to_sheets(phone, session, prob, decision=decision)
+
     if pred == 1:
-        log_19col_to_sheets(phone, session, prob)
         block += (
-            f"💾 Lead saved to CRM (19 columns).\n"
-            f"📲 Our team will call you within 24 hours!"
+            f"Lead saved to CRM.\n"
+            f"Our team will call you within 24 hours!"
         )
     else:
         reasons = []
-        if session.get('CIBIL_Score', 0) < 700:    reasons.append("Low CIBIL score")
-        if foir > 0.5:                              reasons.append("High FOIR")
+        if session.get('CIBIL_Score', 0) < 700:        reasons.append("Low CIBIL score")
+        if foir > 0.5:                                  reasons.append("High FOIR")
         if session.get('Business_Vintage_Yrs', 0) < 2: reasons.append("New business")
-        if session.get("_cibil_neg_flags", []):    reasons.append("Negative credit flags")
+        if session.get("_cibil_neg_flags", []):        reasons.append("Negative credit flags")
         block += (
-            f"📋 Reasons: {' | '.join(reasons) if reasons else 'Multiple factors'}\n"
-            f"💡 Advise client to improve credit profile."
+            f"Reasons: {' | '.join(reasons) if reasons else 'Multiple factors'}\n"
+            f"Advise client to improve credit profile."
         )
 
     clear_session(phone)
