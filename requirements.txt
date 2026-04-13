@@ -1,0 +1,17 @@
+flask
+gunicorn
+twilio
+pandas
+numpy
+scikit-learn
+joblib
+gspread
+oauth2client
+langchain-groq
+pydantic
+pdfplumber
+pikepdf
+python-dotenv
+requests
+groq
+openpyxl
