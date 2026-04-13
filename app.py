@@ -598,8 +598,18 @@ def _prediction_block(session: dict, pred: int, prob: float,
     log_19col_to_sheets(phone, session, prob, decision=decision)
 
     if pred == 1:
+        loan_amt = session.get('Loan_Amount', 0)
+        annual_rate = 0.18  # Assuming 18% ROI for calculation
+        r = annual_rate / 12
+        
+        if loan_amt > 0:
+            block += f"\n📅 EMI Options (18% p.a.):\n"
+            for n in [12, 24, 36]:
+                emi = (loan_amt * r * ((1 + r)**n)) / (((1 + r)**n) - 1)
+                block += f"• {n} Months : Rs.{int(emi):,} / mo\n"
+        
         block += (
-            f"Lead saved to CRM.\n"
+            f"\n✅ Lead saved to CRM.\n"
             f"Our team will call you within 24 hours!"
         )
     else:
