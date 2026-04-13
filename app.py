@@ -358,11 +358,32 @@ def whatsapp_reply():
                         result = handle_pdf_smart(url, mtype, session_ctx)
 
                         if 'error' in result:
-                            final_reply = (
-                                f"⚠️ Could not read document.\n"
-                                f"Reason: {result['error']}\n\n"
-                                + build_unknown_doc_reply()
-                            )
+                            err_msg = result.get('error', '')
+
+                            # ── PASSWORD PROTECTED PDF ──
+                            if 'locked' in err_msg.lower() or 'password' in err_msg.lower():
+                                # Save PDF URL + type in session for retry
+                                if phone not in user_sessions:
+                                    user_sessions[phone] = _empty_session()
+                                user_sessions[phone]['_pending_pdf_url']  = url
+                                user_sessions[phone]['_pending_pdf_type'] = mtype
+                                final_reply = (
+                                    "Your PDF is password protected.\n"
+                                    "--------------------\n"
+                                    "Please reply with the PDF password.\n\n"
+                                    "Common bank passwords:\n"
+                                    "  HDFC: first4letters of name + DDMM of DOB\n"
+                                    "  SBI : first4letters (CAPS) + DDYYYY of DOB\n"
+                                    "  ICICI: first3letters (CAPS) + DOB (DDMMYYYY)\n"
+                                    "  AXIS: first4letters (small) + birth year\n\n"
+                                    "Example reply: john0190"
+                                )
+                            else:
+                                final_reply = (
+                                    f"Could not read document.\n"
+                                    f"Reason: {err_msg}\n\n"
+                                    + build_unknown_doc_reply()
+                                )
                         else:
                             doc_type = result.get("doc_type", "unknown")
                             if doc_type == "cibil":
@@ -424,22 +445,117 @@ def whatsapp_reply():
                     "Or upload: CIBIL PDF / Salary Slip / ITR / Bank Statement"
                 )
             else:
-                extracted = extract_lead_data(incoming_msg)
-                session   = update_session(sender_phone, extracted)
-                missing   = get_missing_fields(session)
+                # ── CHECK: Is there a pending password-locked PDF? ──
+                # If user previously sent a locked PDF, treat this text as the password
+                sess_check = user_sessions.get(sender_phone, {})
+                pending_url  = sess_check.get('_pending_pdf_url', '')
+                pending_type = sess_check.get('_pending_pdf_type', 'application/pdf')
 
-                if missing:
-                    filled = [f for f in CRITICAL_FIELDS if session.get(f, 0) > 0]
-                    fill_str = ", ".join(f.replace('_', ' ') for f in filled)
-                    reply_text = (
-                        f"✅ Got partial data!\n"
-                        f"Have : {fill_str or 'Nothing yet'}\n\n"
-                        + build_next_step_prompt(session)
+                if pending_url and len(incoming_msg.strip()) <= 20:
+                    # Looks like a short password — try to unlock the pending PDF
+                    password_attempt = incoming_msg.strip()
+                    reply_text = f"Trying password '{password_attempt}'... please wait ~30 seconds."
+
+                    def retry_with_password(url, mtype, phone, pwd):
+                        try:
+                            from pdf_parsers import download_pdf, unlock_pdf, detect_doc_type, \
+                                parse_cibil, parse_salary_slip, parse_itr, parse_bank_statement
+                            import pdfplumber, io
+
+                            pdf_bytes  = download_pdf(url)
+                            # Get session name/dob for context, use typed password directly
+                            sess = user_sessions.get(phone, {})
+                            try:
+                                import pikepdf
+                                with pikepdf.open(io.BytesIO(pdf_bytes), password=pwd) as p:
+                                    buf = io.BytesIO()
+                                    p.save(buf)
+                                    unlocked = buf.getvalue()
+                            except Exception:
+                                unlocked = None
+
+                            if not unlocked:
+                                final_reply = (
+                                    f"Password '{pwd}' did not work.\n"
+                                    "Please check the password and try again.\n"
+                                    "Or ask your bank to send an unlocked statement."
+                                )
+                            else:
+                                # Extract text and detect type
+                                raw_text = ""
+                                with pdfplumber.open(io.BytesIO(unlocked)) as pdf:
+                                    for page in pdf.pages[:4]:
+                                        raw_text += (page.extract_text() or "") + "\n"
+                                doc_type = detect_doc_type(raw_text)
+
+                                if doc_type == "cibil":
+                                    result = parse_cibil(unlocked)
+                                    save_cibil_to_session(phone, result, user_sessions)
+                                    final_reply = build_cibil_reply(result)
+                                elif doc_type == "salary":
+                                    result = parse_salary_slip(unlocked)
+                                    save_salary_to_session(phone, result, user_sessions)
+                                    final_reply = build_salary_reply(result)
+                                elif doc_type == "itr":
+                                    result = parse_itr(unlocked)
+                                    save_itr_to_session(phone, result, user_sessions)
+                                    final_reply = build_itr_reply(result)
+                                elif doc_type == "bank":
+                                    result = parse_bank_statement(unlocked)
+                                    save_bank_to_session(phone, result, user_sessions)
+                                    final_reply = build_bank_reply(result)
+                                else:
+                                    final_reply = build_unknown_doc_reply()
+
+                                # Clear pending PDF from session
+                                user_sessions[phone].pop('_pending_pdf_url', None)
+                                user_sessions[phone].pop('_pending_pdf_type', None)
+
+                                # Auto-predict if all fields complete
+                                updated = user_sessions.get(phone, _empty_session())
+                                missing = get_missing_fields(updated)
+                                if not missing and updated.get('Monthly_Income', 0) > 0:
+                                    pred, prob, foir = run_prediction(updated)
+                                    final_reply += _prediction_block(updated, pred, prob, foir, phone)
+
+                            twilio_client = TwilioClient(
+                                os.environ.get('TWILIO_ACCOUNT_SID'),
+                                os.environ.get('TWILIO_AUTH_TOKEN')
+                            )
+                            twilio_client.messages.create(
+                                from_='whatsapp:+14155238886',
+                                to=f'whatsapp:{phone}',
+                                body=final_reply
+                            )
+                            print(f'[PDF PASSWORD] Reply sent to {phone}')
+                        except Exception as pe:
+                            print(f'[PDF PASSWORD ERROR] {pe}')
+
+                    t2 = threading.Thread(
+                        target=retry_with_password,
+                        args=(pending_url, pending_type, sender_phone, password_attempt),
+                        daemon=True
                     )
+                    t2.start()
+
                 else:
-                    pred, prob, foir = run_prediction(session)
-                    reply_text = _prediction_block(session, pred, prob, foir,
-                                                   sender_phone)
+                    # Normal text message — NLP extraction
+                    extracted = extract_lead_data(incoming_msg)
+                    session   = update_session(sender_phone, extracted)
+                    missing   = get_missing_fields(session)
+
+                    if missing:
+                        filled = [f for f in CRITICAL_FIELDS if session.get(f, 0) > 0]
+                        fill_str = ", ".join(f.replace('_', ' ') for f in filled)
+                        reply_text = (
+                            f"Got partial data!\n"
+                            f"Have : {fill_str or 'Nothing yet'}\n\n"
+                            + build_next_step_prompt(session)
+                        )
+                    else:
+                        pred, prob, foir = run_prediction(session)
+                        reply_text = _prediction_block(session, pred, prob, foir,
+                                                       sender_phone)
 
     except Exception as e:
         reply_text = f"⚠️ System Error: {str(e)}"
