@@ -37,9 +37,11 @@ import re
 import json
 import base64
 import requests
+import threading
 from datetime import datetime
 from flask import Flask, request, Response
 from dotenv import load_dotenv
+from twilio.rest import Client as TwilioClient
 
 load_dotenv()
 
@@ -336,43 +338,77 @@ def whatsapp_reply():
                  'spreadsheet' in media_type or \
                  'excel' in media_type:
 
-                session_ctx = user_sessions.get(sender_phone, {})
-                session_ctx["sender_phone"] = sender_phone
-                result = handle_pdf_smart(media_url, media_type, session_ctx)
+                # ASYNC PATTERN: Reply immediately to beat Twilio's 15s timeout,
+                # then process the PDF in a background thread and send the real reply.
+                reply_text = (
+                    "📄 Document received! Analysing your PDF...\n"
+                    "Please wait ~30 seconds for the result."
+                )
 
-                if 'error' in result:
-                    reply_text = (
-                        f"⚠️ Could not read document.\n"
-                        f"Reason: {result['error']}\n\n"
-                        + build_unknown_doc_reply()
-                    )
-                else:
-                    doc_type = result.get("doc_type", "unknown")
+                # Capture variables for background thread
+                _url   = media_url
+                _mtype = media_type
+                _phone = sender_phone
 
-                    # Route to correct session updater & reply builder
-                    if doc_type == "cibil":
-                        save_cibil_to_session(sender_phone, result, user_sessions)
-                        reply_text = build_cibil_reply(result)
-                    elif doc_type == "salary":
-                        save_salary_to_session(sender_phone, result, user_sessions)
-                        reply_text = build_salary_reply(result)
-                    elif doc_type == "itr":
-                        save_itr_to_session(sender_phone, result, user_sessions)
-                        reply_text = build_itr_reply(result)
-                    elif doc_type == "bank":
-                        save_bank_to_session(sender_phone, result, user_sessions)
-                        reply_text = build_bank_reply(result)
-                    else:
-                        reply_text = build_unknown_doc_reply()
+                def process_pdf_async(url, mtype, phone):
+                    """Runs in background: parse PDF then send WhatsApp reply via Twilio REST API."""
+                    try:
+                        session_ctx = user_sessions.get(phone, {})
+                        session_ctx["sender_phone"] = phone
+                        result = handle_pdf_smart(url, mtype, session_ctx)
 
-                    # After any doc parse, check if we have enough for prediction
-                    sess = user_sessions.get(sender_phone, _empty_session())
-                    missing = get_missing_fields(sess)
-                    if not missing and sess.get("Monthly_Income", 0) > 0:
-                        # Auto-run prediction when all fields collected!
-                        pred, prob, foir = run_prediction(sess)
-                        reply_text += _prediction_block(sess, pred, prob, foir,
-                                                         sender_phone)
+                        if 'error' in result:
+                            final_reply = (
+                                f"⚠️ Could not read document.\n"
+                                f"Reason: {result['error']}\n\n"
+                                + build_unknown_doc_reply()
+                            )
+                        else:
+                            doc_type = result.get("doc_type", "unknown")
+                            if doc_type == "cibil":
+                                save_cibil_to_session(phone, result, user_sessions)
+                                final_reply = build_cibil_reply(result)
+                            elif doc_type == "salary":
+                                save_salary_to_session(phone, result, user_sessions)
+                                final_reply = build_salary_reply(result)
+                            elif doc_type == "itr":
+                                save_itr_to_session(phone, result, user_sessions)
+                                final_reply = build_itr_reply(result)
+                            elif doc_type == "bank":
+                                save_bank_to_session(phone, result, user_sessions)
+                                final_reply = build_bank_reply(result)
+                            else:
+                                final_reply = build_unknown_doc_reply()
+
+                            # Auto-predict if all fields complete
+                            sess = user_sessions.get(phone, _empty_session())
+                            missing = get_missing_fields(sess)
+                            if not missing and sess.get("Monthly_Income", 0) > 0:
+                                pred, prob, foir = run_prediction(sess)
+                                final_reply += _prediction_block(sess, pred, prob, foir, phone)
+
+                        # Send reply via Twilio REST (not TwiML — this is outbound)
+                        twilio_client = TwilioClient(
+                            os.environ.get("TWILIO_ACCOUNT_SID"),
+                            os.environ.get("TWILIO_AUTH_TOKEN")
+                        )
+                        twilio_client.messages.create(
+                            from_="whatsapp:+14155238886",
+                            to=f"whatsapp:{phone}",
+                            body=final_reply
+                        )
+                        print(f"[PDF ASYNC] Reply sent to {phone}")
+
+                    except Exception as thread_err:
+                        print(f"[PDF ASYNC ERROR] {thread_err}")
+
+                t = threading.Thread(
+                    target=process_pdf_async,
+                    args=(_url, _mtype, _phone),
+                    daemon=True
+                )
+                t.start()
+
             else:
                 reply_text = "⚠️ Please send only PDF, Excel, or image files."
 
